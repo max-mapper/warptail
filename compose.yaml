@@ -1,0 +1,47 @@
+# warptail: a Tailscale exit node whose internet egress is only Cloudflare WARP.
+# Use ./warptail rather than calling compose directly (it registers WARP and the tailnet login).
+name: warptail
+
+services:
+  # warptorrent's reusable warp-tunnel image (git submodule). Built only as the base for the
+  # warptail image below; never run on its own.
+  tunnel:
+    build: ./vendor/warptorrent/tunnel
+    image: warptail-tunnel
+    scale: 0
+
+  warptail:
+    build:
+      context: ./image
+      additional_contexts:
+        tunnel: service:tunnel
+    image: warptail
+    container_name: warptail
+    hostname: warptail
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv6.conf.all.disable_ipv6: "0"
+      net.ipv6.conf.all.forwarding: "1"
+      net.ipv4.conf.all.src_valid_mark: "1"
+      net.ipv4.conf.all.rp_filter: "2"
+    environment:
+      WARP_MODE: ${WARP_MODE:-masque}
+      WARP_IPV6: ${WARP_IPV6:-1}
+      TS_HOSTNAME: ${TS_HOSTNAME:-warptail}
+      TS_PORT: ${TS_PORT:-41642}
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_EXTRA_ARGS: ${TS_EXTRA_ARGS:-}
+    volumes:
+      - ./config:/config                       # WARP device keys (secret)
+      - tailscale-state:/var/lib/tailscale     # tailnet node identity (secret)
+    ports:
+      # tailscaled's underlay port, so peers can connect directly instead of via a DERP relay.
+      - "${TS_PORT:-41642}:${TS_PORT:-41642}/udp"
+    labels:
+      warptail.mode: ${WARP_MODE:-masque}
+    restart: unless-stopped
+
+volumes:
+  tailscale-state:

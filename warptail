@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# Usage: ./warptail [--masque|--wireguard] <command>
+#
+# Commands:
+#   up        build, register a WARP device if needed, start the exit node (it then restarts on
+#             its own, including after reboots, until `down`), and print the tailnet login link
+#   down      stop and remove the container (keys and the tailnet identity are kept)
+#   status    WARP egress, tailnet login and exit-node approval
+#   login     print the tailnet login link (only needed once)
+#   logs      follow the container's logs
+#   verify    in-container routing/firewall checks, then the kill-switch leaktest
+#   e2e       end-to-end test through a throwaway tailnet client that uses this exit node
+#             (needs TS_TEST_AUTHKEY: an ephemeral, single-use auth key)
+#
+# Options (saved in .env, so they stick):
+#   --masque      WARP over MASQUE / HTTP/3 (default)
+#   --wireguard   WARP over WireGuard
+set -euo pipefail
+# Resolve symlinks, so the script also works when linked into a PATH directory.
+here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+cd "$here"
+
+usage() { sed -n '2,21p' "$here/warptail" | sed 's/^# \{0,1\}//'; }
+C=warptail
+SOCK=/var/run/tailscale/tailscaled.sock
+TS_IMAGE=tailscale/tailscale:v1.104.7
+
+# .env holds settings compose reads: WARP_MODE, TS_HOSTNAME, TS_PORT, TS_AUTHKEY, ...
+touch .env; chmod 600 .env
+env_get() { awk -F= -v k="$1" '$1==k {sub(/^[^=]*=/, ""); print; exit}' .env; }
+env_set() {
+  if grep -q "^$1=" .env; then sed -i.bak "s|^$1=.*|$1=$2|" .env && rm -f .env.bak
+  else echo "$1=$2" >> .env; fi
+}
+
+args=()
+while (($#)); do
+  case "$1" in
+    --masque) env_set WARP_MODE masque ;;
+    --wireguard) env_set WARP_MODE wireguard ;;
+    -h|--help) usage; exit 0 ;;
+    *) args+=("$1") ;;
+  esac
+  shift
+done
+set -- "${args[@]+"${args[@]}"}"
+mode="$(env_get WARP_MODE)"; mode="${mode:-masque}"
+
+if docker compose version >/dev/null 2>&1; then compose=(docker compose)
+elif command -v docker-compose >/dev/null; then compose=(docker-compose)
+else echo "need docker compose (or docker-compose)" >&2; exit 1; fi
+
+if [[ ! -f vendor/warptorrent/tunnel/lib.sh ]]; then
+  echo "→ fetching warptorrent (git submodule)"
+  git submodule update --init vendor/warptorrent
+fi
+
+tsx() { docker exec "$C" tailscale --socket="$SOCK" "$@"; }
+backend_state() { tsx status --json 2>/dev/null | docker exec -i "$C" jq -r .BackendState 2>/dev/null || true; }
+login_url() { docker logs "$C" 2>&1 | grep -Eo 'https://login\.tailscale\.com/[^ ]+' | tail -1; }
+running() { [[ "$(docker inspect -f '{{.State.Running}}' "$C" 2>/dev/null)" == true ]]; }
+need_running() { running || { echo "warptail is not running; start it with ./warptail up" >&2; exit 1; }; }
+
+show_login() {
+  local state="" i
+  for i in $(seq 1 30); do
+    state=$(backend_state)
+    [[ "$state" == Running ]] && break
+    [[ "$state" == NeedsLogin && -n "$(login_url)" ]] && break
+    sleep 1
+  done
+  case "$state" in
+    Running) echo "✓ logged in to your tailnet as $(tsx status --json | docker exec -i "$C" jq -r .Self.DNSName)" ;;
+    NeedsLogin)
+      echo "→ log this node in to your tailnet (once): $(login_url)"
+      echo "  then approve it as an exit node: Tailscale admin console → Machines → $(env_get TS_HOSTNAME | grep . || echo warptail) → Edit route settings → Use as exit node" ;;
+    *) echo "tailscale state: ${state:-unknown}; see ./warptail logs" ;;
+  esac
+}
+
+autostart_hint() {
+  case "$(uname -s)" in
+    Darwin)
+      if command -v colima >/dev/null && docker context show 2>/dev/null | grep -q colima; then
+        brew services list 2>/dev/null | grep -q '^colima .*started' ||
+          echo "  note: to bring warptail back after a reboot, start Colima at login: brew services start colima"
+      else
+        echo "  note: to bring warptail back after a reboot, enable Docker Desktop → Settings → General → Start Docker Desktop when you sign in"
+      fi ;;
+    Linux)
+      systemctl is-enabled docker >/dev/null 2>&1 ||
+        echo "  note: to bring warptail back after a reboot: sudo systemctl enable docker" ;;
+  esac
+}
+
+case "${1:-}" in
+  up)
+    out=$("${compose[@]}" build -q 2>&1) || { echo "$out" >&2; exit 1; }
+    cfg=config/usque.json; [[ "$mode" == wireguard ]] && cfg=config/wgcf-profile.conf
+    [[ -s "$cfg" ]] || vendor/warptorrent/scripts/register.sh warptail-tunnel "$mode" config
+    "${compose[@]}" up -d --wait --wait-timeout 120 warptail
+    echo "✓ warptail up: WARP over $mode, restarts on its own until ./warptail down"
+    show_login
+    autostart_hint ;;
+  down)
+    "${compose[@]}" down ;;
+  status)
+    need_running
+    echo "mode=$(docker inspect -f '{{index .Config.Labels "warptail.mode"}}' "$C") health=$(docker inspect -f '{{.State.Health.Status}}' "$C")"
+    docker exec "$C" curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|colo|warp)='
+    show_login
+    tsx status --json | docker exec -i "$C" jq -r 'if (.Self.AllowedIPs // [] | index("0.0.0.0/0")) then "✓ approved as an exit node" else "✗ exit node not approved yet (admin console → Edit route settings)" end' ;;
+  login)
+    need_running; show_login ;;
+  logs)
+    docker logs -f "$C" ;;
+  verify)
+    need_running
+    echo "== routing, firewall and Tailscale checks"
+    rc=0; docker exec "$C" warptail-verify || rc=1
+    echo
+    echo "== kill switch (warptorrent leaktest)"
+    vendor/warptorrent/scripts/leaktest.sh "$C"
+    exit "$rc" ;;
+  e2e)
+    need_running
+    key="${TS_TEST_AUTHKEY:-$(env_get TS_TEST_AUTHKEY)}"
+    [[ -n "$key" ]] || { echo "set TS_TEST_AUTHKEY to an ephemeral auth key (admin console → Settings → Keys)" >&2; exit 2; }
+    [[ "$(backend_state)" == Running ]] || { echo "log warptail in first (./warptail login)" >&2; exit 1; }
+    exec "$here/scripts/e2e.sh" "$key" ;;
+  ""|-h|--help) usage ;;
+  *) echo "unknown command: $1" >&2; usage; exit 2 ;;
+esac

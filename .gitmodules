@@ -1,0 +1,4 @@
+[submodule "vendor/warptorrent"]
+	path = vendor/warptorrent
+	url = https://github.com/max-mapper/warptorrent.git
+	branch = shared-tunnel
