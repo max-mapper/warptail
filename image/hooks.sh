@@ -60,6 +60,8 @@ hook_routes() {
   # Underlay table: marked (tailscaled's own) packets leave via the Docker uplink. IPv4 only;
   # marked IPv6 is unreachable rather than falling through to the WARP default.
   ip -4 route replace default via "$GW" dev "$UPLINK" table "$UNDERLAY_TABLE"
+  # Peers on the same Docker network (e.g. ./warptail e2e) are reached directly, not via the gateway.
+  ip -4 route replace "$BRIDGE" dev "$UPLINK" table "$UNDERLAY_TABLE"
   ip -4 route replace unreachable default metric 4000 table "$UNDERLAY_TABLE"
   ip -6 route replace unreachable default table "$UNDERLAY_TABLE" 2>/dev/null || true
   for d in $WARP_DNS; do

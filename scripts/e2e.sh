@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# Usage: scripts/e2e.sh <ephemeral-auth-key>     (normally via ./warptail e2e)
+# Usage: scripts/e2e.sh <ephemeral-auth-key> [lan|nat]     (normally via ./warptail e2e [nat])
 #
 # End-to-end proof from a real tailnet client's point of view, standing in for your phone:
 # a throwaway Tailscale node (ephemeral, so it disappears from your tailnet afterwards) joins
 # with warptail as its exit node, then:
 #   1. its internet egress must be WARP (warp=on), and not this host's real IP;
 #   2. with WARP cut off inside warptail, its traffic must fail, not go out some other way.
+# lan (default): the client joins warptail's Docker network, like a phone on the same Wi-Fi, so
+#   the tailnet leg can be direct.
+# nat: the client sits on Docker's default bridge, behind the same hard NAT as warptail, like
+#   a remote device that can't hole-punch. The tailnet leg then needs DERP or a peer relay.
 set -euo pipefail
-key="$1"
+key="$1" where="${2:-lan}"
 C=warptail E=warptail-e2e
 SOCK=/var/run/tailscale/tailscaled.sock
 TS_IMAGE=tailscale/tailscale:v1.104.7
@@ -29,9 +33,13 @@ real4=$(curl -4 -s --max-time 10 https://www.cloudflare.com/cdn-cgi/trace | awk 
 warp_ip=$(docker exec "$C" curl -s --max-time 10 https://www.cloudflare.com/cdn-cgi/trace | awk -F= '$1=="ip"{print $2}')
 echo "warptail tailnet IP $exit_ip, WARP egress $warp_ip, host real IPv4 ${real4:-none}"
 
-echo "→ starting a throwaway tailnet client that uses warptail as its exit node"
+# The client joins warptail's Docker network, like a phone on the same Wi-Fi, so the tailnet
+# leg can be direct. (From anywhere else in this VM it would sit behind the same hard NAT.)
+net=bridge
+[[ "$where" == nat ]] || net=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$C")
+echo "→ starting a throwaway tailnet client on $net that uses warptail as its exit node"
 docker rm -f "$E" >/dev/null 2>&1 || true
-docker run -d --name "$E" --cap-add NET_ADMIN --device /dev/net/tun \
+docker run -d --name "$E" --network "$net" --cap-add NET_ADMIN --device /dev/net/tun \
   -e TS_AUTHKEY="$key" -e TS_USERSPACE=false -e TS_HOSTNAME=warptail-e2e \
   -e TS_EXTRA_ARGS="--exit-node=$exit_ip --accept-dns=true" \
   "$TS_IMAGE" >/dev/null
@@ -42,7 +50,13 @@ for i in $(seq 1 60); do
   sleep 2
 done
 pass "client is on the tailnet with warptail as its exit node"
-docker exec "$E" tailscale ping -c 3 "$exit_ip" 2>&1 | tail -1 | sed 's/^/    /' || true
+path=$(docker exec "$E" tailscale ping -c 10 "$exit_ip" 2>&1 | grep -E '^pong' | tail -1 || true)
+case "$path" in
+  *DERP*) echo "  · tailnet leg relayed by Tailscale DERP: $path" ;;
+  *peer-relay*) echo "  · tailnet leg via a peer relay: $path" ;;
+  pong*) pass "tailnet leg is direct: $path" ;;
+  *) echo "  · could not determine the tailnet path" ;;
+esac
 
 echo "1) client egress"
 t=$(trace 15) || fail "client could not reach the internet through warptail"

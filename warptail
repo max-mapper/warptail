@@ -9,8 +9,9 @@
 #   login     print the tailnet login link (only needed once)
 #   logs      follow the container's logs
 #   verify    in-container routing/firewall checks, then the kill-switch leaktest
-#   e2e       end-to-end test through a throwaway tailnet client that uses this exit node
-#             (needs TS_TEST_AUTHKEY: an ephemeral, single-use auth key)
+#   e2e [nat] end-to-end test through a throwaway tailnet client that uses this exit node
+#             (needs TS_TEST_AUTHKEY: an ephemeral auth key). Default: client on warptail's
+#             Docker network (direct path); nat: client behind the same NAT (relayed path)
 #
 # Options (saved in .env, so they stick):
 #   --masque      WARP over MASQUE / HTTP/3 (default)
@@ -20,7 +21,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 cd "$here"
 
-usage() { sed -n '2,21p' "$here/warptail" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,22p' "$here/warptail" | sed 's/^# \{0,1\}//'; }
 C=warptail
 SOCK=/var/run/tailscale/tailscaled.sock
 TS_IMAGE=tailscale/tailscale:v1.104.7
@@ -127,7 +128,7 @@ case "${1:-}" in
     key="${TS_TEST_AUTHKEY:-$(env_get TS_TEST_AUTHKEY)}"
     [[ -n "$key" ]] || { echo "set TS_TEST_AUTHKEY to an ephemeral auth key (admin console → Settings → Keys)" >&2; exit 2; }
     [[ "$(backend_state)" == Running ]] || { echo "log warptail in first (./warptail login)" >&2; exit 1; }
-    exec "$here/scripts/e2e.sh" "$key" ;;
+    exec "$here/scripts/e2e.sh" "$key" "${2:-lan}" ;;
   ""|-h|--help) usage ;;
   *) echo "unknown command: $1" >&2; usage; exit 2 ;;
 esac

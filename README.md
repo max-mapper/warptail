@@ -62,7 +62,7 @@ Settings live in `.env` (gitignored, mode 600):
 | `WARP_MODE` | `masque` | `masque` or `wireguard` (`--masque` / `--wireguard` set it) |
 | `WARP_IPV6` | `1` | carry IPv6 through WARP too (`0` = drop IPv6) |
 | `TS_HOSTNAME` | `warptail` | the node's name in your tailnet |
-| `TS_PORT` | `41642` | tailscaled's UDP port, published on the host so peers can connect directly (not 41641, so it can't clash with a Tailscale install on the host) |
+| `TS_PORT` | `41642` | tailscaled's UDP port, published on the host so peers can connect directly on Linux hosts (not 41641, so it can't clash with a Tailscale install on the host) |
 | `TS_AUTHKEY` | | optional, for logging in without the link |
 | `TS_EXTRA_ARGS` | | extra `tailscale up` flags |
 | `TS_TEST_AUTHKEY` | | ephemeral auth key used only by `./warptail e2e` |
@@ -101,6 +101,36 @@ the WARP endpoint reachable on the uplink) comes from warptorrent's tunnel image
 can only add rules ahead of its final drops. tailscaled runs with `--netfilter-mode=off`, so it
 never touches the firewall.
 
+## Direct connections (macOS)
+
+On Linux, Docker's NAT keeps the same outside port for every destination ("easy" NAT). The
+published UDP port also works there, so phones connect to warptail directly.
+
+On macOS, the container runs inside a VM, and every VM networking mode we measured is a "hard"
+NAT: the outside port changes per destination (`MappingVariesByDestIP: true` in
+`tailscale netcheck`). That includes Colima's default Lima user-mode network and Apple's own VM
+NAT (`vzNAT`). Colima's default `ssh` port forwarder also can't carry UDP. So Tailscale can't
+hole-punch to warptail, and falls back to a DERP relay, which works but is slower and rate-limited.
+
+**Fix: make the Mac's own Tailscale app a [peer relay](https://tailscale.com/kb/1591/peer-relays).**
+The Mac is on the same machine as warptail and sits behind your router's (usually easy) NAT, so
+devices can reach it directly. It forwards only end-to-end-encrypted WireGuard packets, and
+warptail's internet egress is unchanged.
+
+1. On the Mac: `tailscale set --relay-server-port=40000` (undo with `--relay-server-port=""`).
+2. In the [tailnet policy](https://login.tailscale.com/admin/acls/file), add a grant (dst is the
+   Mac's tailnet IP or a tag on it):
+   ```json
+   "grants": [{ "src": ["*"], "dst": ["100.x.y.z"], "app": { "tailscale.com/cap/relay": [] } }]
+   ```
+3. Check: `docker exec warptail tailscale --socket=/var/run/tailscale/tailscaled.sock ping <phone>`
+   should say `via peer-relay(…)` rather than `via DERP(…)`. `./warptail e2e nat` tests the same
+   path with a client behind the same NAT.
+
+For truly direct connections on macOS, the VM needs its own LAN address: Colima in bridged mode
+(`brew install socket_vmnet`, a one-time sudo setup, then `colima start --network-address
+--network-mode bridged`), or Docker Desktop with host networking. A Linux host needs none of this.
+
 ## Verifying it
 
 - `./warptail verify` runs inside the container and asks the kernel where each kind of traffic
@@ -110,10 +140,14 @@ never touches the firewall.
   runs warptorrent's leaktest. That test simulates a WARP outage and takes `warp0` down, and in
   both cases HTTPS, DNS and ICMP probes must all fail.
 - `./warptail e2e` is the closest thing to your phone. It starts a throwaway, ephemeral tailnet
-  client in Docker that uses warptail as its exit node. It checks that the client's egress is
+  client in Docker that uses warptail as its exit node. By default the client sits on warptail's
+  Docker network, like a phone on the same Wi-Fi, so the tailnet leg is direct. `./warptail e2e nat`
+  puts it behind the same NAT instead, so the leg goes through DERP or a peer relay. Either way the
+  test prints which path was used. It checks that the client's egress is
   `warp=on` and not this machine's IP, and that DNS works. Then it cuts WARP inside warptail and
   checks that the client's HTTPS and ICMP traffic fail rather than leak. Needs `TS_TEST_AUTHKEY`:
-  admin console → Settings → Keys → *Generate auth key*, with **Ephemeral** on and **Reusable** off.
+  admin console → Settings → Keys → *Generate auth key*, with **Ephemeral** on. Turn
+  **Reusable** on too if you want to run it more than once.
 - From the phone: <https://www.cloudflare.com/cdn-cgi/trace> shows `warp=on`, and
   <https://test-ipv6.com> shows Cloudflare addresses for both IPv4 and IPv6.
 
@@ -122,8 +156,8 @@ never touches the firewall.
 - `./warptail verify`: all checks pass. IPv4 and IPv6 egress are WARP (`warp=on`). Exit-node
   traffic from the tailnet routes to `warp0` and tailscaled's underlay to the uplink. Exit-node
   DNS (marked) routes to `warp0`. The leaktest passes in both MASQUE and WireGuard modes.
-- `./warptail e2e`: the throwaway client's egress was the WARP IP (`warp=on`), not the host's,
-  and its DNS worked. With WARP cut off inside warptail, its HTTPS (by hostname and to 1.1.1.1)
+- `./warptail e2e`: the tailnet leg was direct (`pong … via 172.21.0.2:41642`). The throwaway
+  client's egress was the WARP IP (`warp=on`), not the host's, and its DNS worked. With WARP cut off inside warptail, its HTTPS (by hostname and to 1.1.1.1)
   and ICMP were all blocked.
 
 ## Caveats
@@ -133,10 +167,6 @@ never touches the firewall.
 - **Tailscale's underlay is not hidden.** Your ISP (and the Wi-Fi your phone is on) can see that
   the phone talks to this machine over Tailscale, though not what's inside. Only the exit-node
   traffic goes through WARP.
-- **Direct connections behind Colima / Docker Desktop.** The container sits behind the VM's NAT
-  as well as your router's. If a direct path can't be punched, Tailscale relays over DERP, which
-  still works but is slower. `docker exec warptail tailscale --socket=/var/run/tailscale/tailscaled.sock netcheck`
-  shows what it found. On Linux the published UDP port makes direct connections easy.
 - **MASQUE depends on usque**, which describes itself as unstable. If it misbehaves, run
   `./warptail --wireguard up`.
 - **`config/` and the `warptail_tailscale-state` volume hold secrets** (WARP keys, tailnet node key).
