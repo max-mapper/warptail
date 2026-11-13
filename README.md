@@ -33,7 +33,7 @@ macOS with Colima. Docker Desktop and OrbStack work the same way, as does Docker
 Images are multi-arch (amd64 and arm64).
 
 ```
-git clone --recursive <this repo> && cd warptail   # or: git submodule update --init
+git clone --recursive https://github.com/max-mapper/warptail.git && cd warptail
 ./warptail up
 ```
 
@@ -116,6 +116,15 @@ never touches the firewall.
   admin console → Settings → Keys → *Generate auth key*, with **Ephemeral** on and **Reusable** off.
 - From the phone: <https://www.cloudflare.com/cdn-cgi/trace> shows `warp=on`, and
   <https://test-ipv6.com> shows Cloudflare addresses for both IPv4 and IPv6.
+
+## Verified (2026-11-13, macOS, Docker via Colima on arm64)
+
+- `./warptail verify`: all checks pass. IPv4 and IPv6 egress are WARP (`warp=on`). Exit-node
+  traffic from the tailnet routes to `warp0` and tailscaled's underlay to the uplink. Exit-node
+  DNS (marked) routes to `warp0`. The leaktest passes in both MASQUE and WireGuard modes.
+- `./warptail e2e`: the throwaway client's egress was the WARP IP (`warp=on`), not the host's,
+  and its DNS worked. With WARP cut off inside warptail, its HTTPS (by hostname and to 1.1.1.1)
+  and ICMP were all blocked.
 
 ## Caveats
 
