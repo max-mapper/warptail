@@ -164,6 +164,11 @@ For truly direct connections on macOS, the VM needs its own LAN address: Colima 
   kill-switch checks passed.
 - A real Android phone on the home Wi-Fi: `tailscale ping` from warptail went DERP → peer relay →
   direct (`via 192.168.0.124:…`), because the phone isn't behind a NAT relative to the Mac.
+- The same phone on mobile data: its traffic exited via WARP (`fwd_via_warp` counting, `fwd_blocked`
+  0), but the tailnet leg used DERP. The carrier's NAT rules out a direct path, even to the Mac.
+  The peer relay is unreachable from outside, because the home router drops unsolicited inbound
+  UDP. To use the relay on mobile data, forward UDP 40000 on the router to the Mac, and run
+  `tailscale set --relay-server-static-endpoints=<public IPv4>:40000`.
 
 ## Caveats
 
