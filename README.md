@@ -159,6 +159,11 @@ For truly direct connections on macOS, the VM needs its own LAN address: Colima 
 - `./warptail e2e`: the tailnet leg was direct (`pong … via 172.21.0.2:41642`). The throwaway
   client's egress was the WARP IP (`warp=on`), not the host's, and its DNS worked. With WARP cut off inside warptail, its HTTPS (by hostname and to 1.1.1.1)
   and ICMP were all blocked.
+- `./warptail e2e nat` (client behind the same hard NAT, Mac's Tailscale as peer relay): the
+  tailnet leg went `via peer-relay(192.168.0.148:40000)` in about 1 ms, and the same egress and
+  kill-switch checks passed.
+- A real Android phone on the home Wi-Fi: `tailscale ping` from warptail went DERP → peer relay →
+  direct (`via 192.168.0.124:…`), because the phone isn't behind a NAT relative to the Mac.
 
 ## Caveats
 
