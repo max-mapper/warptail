@@ -18,7 +18,13 @@ services:
     image: warptail
     container_name: warptail
     hostname: warptail
-    cap_add: [NET_ADMIN]
+    # Least privilege: no capabilities but the ones the tunnel and tailscaled need, no privilege
+    # escalation, read-only root filesystem.
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, NET_RAW, DAC_OVERRIDE]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs: ["/run", "/tmp", "/var/run", "/var/cache"]
     devices: ["/dev/net/tun:/dev/net/tun"]
     sysctls:
       net.ipv4.ip_forward: "1"
@@ -31,10 +37,13 @@ services:
       WARP_IPV6: ${WARP_IPV6:-1}
       TS_HOSTNAME: ${TS_HOSTNAME:-warptail}
       TS_PORT: ${TS_PORT:-41642}
-      TS_AUTHKEY: ${TS_AUTHKEY:-}
       TS_EXTRA_ARGS: ${TS_EXTRA_ARGS:-}
+    secrets: [ts_authkey]   # /run/secrets/ts_authkey, not in the container's environment
     volumes:
       - ./config:/config                       # WARP device keys (secret)
+      # With a read-only root, Docker's own resolv.conf is read-only too. This file is written by
+      # the entrypoint with the tunnel resolvers, and Docker never rewrites a file mounted here.
+      - ./config/resolv.conf:/etc/resolv.conf
       - tailscale-state:/var/lib/tailscale     # tailnet node identity (secret)
     ports:
       # tailscaled's underlay port, so peers can connect directly instead of via a DERP relay.
@@ -45,3 +54,7 @@ services:
 
 volumes:
   tailscale-state:
+
+secrets:
+  ts_authkey:
+    environment: TS_AUTHKEY   # optional, from .env; used only for the first login

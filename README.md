@@ -41,6 +41,8 @@ git clone --recursive https://github.com/max-mapper/warptail.git && cd warptail
    starts the container, and prints a **login link**. Open it and add the node to your tailnet.
    This happens once. The node identity is kept in the `warptail_tailscale-state` Docker volume.
    For a headless setup, put `TS_AUTHKEY=tskey-auth-…` in `.env` before the first `up` instead.
+   It's handed to the container as a secret file (not an environment variable or command-line
+   argument), used only while the node isn't logged in, and can be removed from `.env` afterwards.
 2. In the [admin console](https://login.tailscale.com/admin/machines), open **warptail** →
    **Edit route settings** → tick **Use as exit node**.
 3. On your phone: Tailscale → **Exit node** → **warptail**. Then open
@@ -63,8 +65,8 @@ Settings live in `.env` (gitignored, mode 600):
 | `WARP_IPV6` | `1` | carry IPv6 through WARP too (`0` = drop IPv6) |
 | `TS_HOSTNAME` | `warptail` | the node's name in your tailnet |
 | `TS_PORT` | `41642` | tailscaled's UDP port, published on the host so peers can connect directly on Linux hosts (not 41641, so it can't clash with a Tailscale install on the host) |
-| `TS_AUTHKEY` | | optional, for logging in without the link |
-| `TS_EXTRA_ARGS` | | extra `tailscale up` flags |
+| `TS_AUTHKEY` | | optional, for the first login without the link; remove it afterwards |
+| `TS_EXTRA_ARGS` | | extra `tailscale up` flags. Flags warptail sets itself (`--exit-node`, `--accept-dns`, `--accept-routes`, `--netfilter-mode`, …) are refused, because changing them would void the guarantees |
 | `TS_TEST_AUTHKEY` | | ephemeral auth key used only by `./warptail e2e` |
 
 ## How it works
@@ -87,14 +89,27 @@ One container, one network namespace, two kinds of traffic kept apart:
 2. **Tailscale's own underlay** is the WireGuard-encrypted phone↔node packets, plus DERP and the
    control plane. tailscaled tags all its own sockets with fwmark `0x80000`. A policy rule
    (priority 5200, ahead of tailscaled's own rules) sends marked packets to table 200, whose
-   default route is the Docker uplink. The output chain lets marked packets out the uplink.
-   Setting a socket mark needs `CAP_NET_ADMIN`, which only this container's processes have.
+   default route is the Docker uplink. The output chain lets marked packets out the uplink, but
+   only what the underlay needs: UDP from tailscaled's own port, and TCP 80/443. Marked DNS
+   (ports 53/853) is dropped and counted (`underlay_dns_blocked`), and so is anything else
+   (`underlay_blocked`; in practice only router port-mapping probes, which can't work from a
+   container anyway). Setting a socket mark needs `CAP_NET_ADMIN`, which only this container's
+   processes have.
    Doing it this way keeps the phone↔node leg direct instead of hairpinning it through
    Cloudflare, and keeps the tailnet connected while WARP reconnects.
 3. **DNS:** a device using an exit node sends its DNS to the exit node, and tailscaled resolves it
    with the container's resolvers (1.1.1.1 / 1.0.0.1 and the IPv6 equivalents) from marked
    sockets. Rules at priority 5100 send those resolver addresses through `warp0` regardless of
    mark, so DNS exits via WARP too, and is unreachable when WARP is down.
+
+Docker's embedded resolver (`127.0.0.11`) resolves from the host, outside the tunnel, so the
+output chain drops it. `/etc/resolv.conf` is a file warptail owns (`config/resolv.conf`, written
+at start with the tunnel resolvers), so Docker can't rewrite it. The supervisor restores it if it
+changes, and the healthcheck fails while it differs.
+
+The container runs with every capability dropped except `NET_ADMIN`, `NET_RAW` and
+`DAC_OVERRIDE` (to read the WARP keys owned by your user), with `no-new-privileges` and a
+read-only root filesystem. Third-party binaries and base images are pinned by SHA-256.
 
 The base kill switch (default-drop nftables on input, forward and output, no default route, only
 the WARP endpoint reachable on the uplink) comes from warptorrent's tunnel image. warptail's hooks
@@ -123,6 +138,8 @@ warptail's internet egress is unchanged.
    ```json
    "grants": [{ "src": ["*"], "dst": ["100.x.y.z"], "app": { "tailscale.com/cap/relay": [] } }]
    ```
+   `"*"` lets every device in the tailnet relay through the Mac. The relay only ever sees
+   encrypted packets, but if your tailnet has shared users, list your own devices instead.
 3. Check: `docker exec warptail tailscale --socket=/var/run/tailscale/tailscaled.sock ping <phone>`
    should say `via peer-relay(…)` rather than `via DERP(…)`. `./warptail e2e nat` tests the same
    path with a client behind the same NAT.
@@ -133,8 +150,9 @@ For truly direct connections on macOS, the VM needs its own LAN address: Colima 
 
 ## Verifying it
 
-- `./warptail verify` runs inside the container and asks the kernel where each kind of traffic
-  would go (`ip route get … iif tailscale0`, `… mark 0x80000`). It checks that every chain is
+- `./warptail verify` runs inside the container. It fails if `resolv.conf` has drifted, or if any
+  DNS was blocked trying to leave outside WARP (`docker_dns_blocked`, `underlay_dns_blocked`).
+  It also asks the kernel where each kind of traffic would go (`ip route get … iif tailscale0`, `… mark 0x80000`). It checks that every chain is
   policy drop, shows the login and approval state, and prints the packet counters, including
   `fwd_blocked` (forwarded packets that tried to leave by anything other than `warp0`). Then it
   runs warptorrent's leaktest. That test simulates a WARP outage and takes `warp0` down, and in
@@ -145,7 +163,9 @@ For truly direct connections on macOS, the VM needs its own LAN address: Colima 
   puts it behind the same NAT instead, so the leg goes through DERP or a peer relay. Either way the
   test prints which path was used. It checks that the client's egress is
   `warp=on` and not this machine's IP, and that DNS works. Then it cuts WARP inside warptail and
-  checks that the client's HTTPS and ICMP traffic fail rather than leak. Needs `TS_TEST_AUTHKEY`:
+  checks that the client's HTTPS, ICMP and DNS all fail rather than leak. The DNS probe uses a
+  name never looked up before, so no cache can answer it. Finally it checks that no DNS was
+  blocked trying to leave outside WARP. Needs `TS_TEST_AUTHKEY`:
   admin console → Settings → Keys → *Generate auth key*, with **Ephemeral** on. Turn
   **Reusable** on too if you want to run it more than once.
 - From the phone: <https://www.cloudflare.com/cdn-cgi/trace> shows `warp=on`, and
@@ -170,6 +190,10 @@ For truly direct connections on macOS, the VM needs its own LAN address: Colima 
   UDP. To use the relay on mobile data, forward UDP 40000 on the router to the Mac, and run
   `tailscale set --relay-server-static-endpoints=<public IPv4>:40000`.
 
+- After the security review ([SECURITY-REVIEW.md](SECURITY-REVIEW.md) findings F1–F8 fixed): `verify`, the
+  leaktest (including the new 127.0.0.11 probe) and both `e2e` modes pass. The narrowed underlay
+  rule blocks only router port-mapping probes (UDP 5351, 1900).
+
 ## Caveats
 
 - **WARP is a privacy relay, not an anonymity network.** Websites see a Cloudflare IP, but
@@ -180,3 +204,5 @@ For truly direct connections on macOS, the VM needs its own LAN address: Colima 
 - **MASQUE depends on usque**, which describes itself as unstable. If it misbehaves, run
   `./warptail --wireguard up`.
 - **`config/` and the `warptail_tailscale-state` volume hold secrets** (WARP keys, tailnet node key).
+- **The published UDP port listens on every host interface.** On Linux, Docker's port publishing
+  bypasses most host firewalls. The port only speaks authenticated WireGuard to tailnet peers.

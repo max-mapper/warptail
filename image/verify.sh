@@ -35,6 +35,10 @@ if [ "$WARP_IPV6" = 1 ]; then
   echo "$t6" | grep -Eq '^warp=(on|plus)$' && pass "IPv6 trace: $(echo "$t6" | grep -E '^(ip|warp)=' | tr '\n' ' ')" || fail "IPv6 egress is not WARP"
 fi
 
+echo "DNS"
+warp_resolv_ok && pass "resolv.conf lists only the tunnel resolvers ($WARP_DNS)" ||
+  fail "resolv.conf has drifted from $WARP_DNS: $(awk '$1=="nameserver"{printf "%s ", $2}' /etc/resolv.conf)"
+
 echo "Firewall (nftables table inet warp)"
 for c in input forward output; do
   nft list chain inet warp "$c" 2>/dev/null | grep -q "hook $c priority filter; policy drop;" &&
@@ -42,7 +46,7 @@ for c in input forward output; do
 done
 others=$(nft list tables | grep -v '^table inet warp$' | tr '\n' ' ')
 [ -z "$others" ] && pass "no other nftables tables" ||
-  echo "  · also loaded: ${others}(Docker's embedded-DNS NAT for 127.0.0.11, unused here; a packet our table drops stays dropped whatever other tables say)"
+  echo "  · also loaded: ${others}(Docker's embedded-DNS NAT for 127.0.0.11; our output chain drops 127.0.0.11, and a packet our table drops stays dropped whatever other tables say)"
 
 echo "Routing decisions"
 ts_ip=$(ts ip -4 2>/dev/null | head -1)
@@ -82,9 +86,17 @@ if [ "$state" = Running ]; then
 fi
 
 echo "Counters (packets/bytes since start)"
-for c in fwd_via_warp fwd_blocked out_underlay out_tunnel out_blocked in_blocked; do
-  printf '  %-13s %s\n' "$c" "$(nft list counter inet warp "$c" 2>/dev/null | awk '/packets/ {print $2" pkts, "$4" bytes"}')"
+pkts() { nft list counter inet warp "$1" 2>/dev/null | awk '/packets/ {print $2}'; }
+for c in fwd_via_warp fwd_blocked out_underlay underlay_blocked out_tunnel out_blocked in_blocked; do
+  printf '  %-21s %s\n' "$c" "$(nft list counter inet warp "$c" 2>/dev/null | awk '/packets/ {print $2" pkts, "$4" bytes"}')"
 done
-echo "  fwd_blocked counts forwarded packets that tried to leave by any interface other than $WARP_IF."
+echo "  fwd_blocked: forwarded packets that tried to leave by anything other than $WARP_IF."
+echo "  underlay_blocked: tailscaled packets outside its UDP port and TCP 80/443 (e.g. router port-mapping probes)."
+# Blocked, so nothing leaked, but either one means something tried to resolve outside WARP.
+for c in docker_dns_blocked underlay_dns_blocked; do
+  n=$(pkts "$c")
+  [ "${n:-0}" -eq 0 ] && pass "$c: 0 (no DNS attempted outside WARP)" ||
+    fail "$c: $n packets of DNS tried to bypass WARP (blocked; check resolv.conf and TS_EXTRA_ARGS)"
+done
 
 [ "$fails" -eq 0 ] && echo "all checks passed" || { echo "$fails check(s) failed"; exit 1; }

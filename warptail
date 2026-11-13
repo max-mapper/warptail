@@ -24,7 +24,6 @@ cd "$here"
 usage() { sed -n '2,22p' "$here/warptail" | sed 's/^# \{0,1\}//'; }
 C=warptail
 SOCK=/var/run/tailscale/tailscaled.sock
-TS_IMAGE=tailscale/tailscale:v1.104.7
 
 # .env holds settings compose reads: WARP_MODE, TS_HOSTNAME, TS_PORT, TS_AUTHKEY, ...
 touch .env; chmod 600 .env
@@ -33,6 +32,9 @@ env_set() {
   if grep -q "^$1=" .env; then sed -i.bak "s|^$1=.*|$1=$2|" .env && rm -f .env.bak
   else echo "$1=$2" >> .env; fi
 }
+
+# The compose secret ts_authkey needs this variable to exist, even when empty.
+grep -q '^TS_AUTHKEY=' .env || echo 'TS_AUTHKEY=' >> .env
 
 args=()
 while (($#)); do
@@ -99,6 +101,7 @@ case "${1:-}" in
     out=$("${compose[@]}" build -q 2>&1) || { echo "$out" >&2; exit 1; }
     cfg=config/usque.json; [[ "$mode" == wireguard ]] && cfg=config/wgcf-profile.conf
     [[ -s "$cfg" ]] || vendor/warptorrent/scripts/register.sh warptail-tunnel "$mode" config
+    touch config/resolv.conf   # must exist as a file, or Docker creates a directory there
     "${compose[@]}" up -d --wait --wait-timeout 120 warptail
     echo "✓ warptail up: WARP over $mode, restarts on its own until ./warptail down"
     show_login
@@ -128,7 +131,8 @@ case "${1:-}" in
     key="${TS_TEST_AUTHKEY:-$(env_get TS_TEST_AUTHKEY)}"
     [[ -n "$key" ]] || { echo "set TS_TEST_AUTHKEY to an ephemeral auth key (admin console → Settings → Keys)" >&2; exit 2; }
     [[ "$(backend_state)" == Running ]] || { echo "log warptail in first (./warptail login)" >&2; exit 1; }
-    exec "$here/scripts/e2e.sh" "$key" "${2:-lan}" ;;
+    # The key goes through the environment, never a command line (visible in ps).
+    TS_TEST_AUTHKEY="$key" exec "$here/scripts/e2e.sh" "${2:-lan}" ;;
   ""|-h|--help) usage ;;
   *) echo "unknown command: $1" >&2; usage; exit 2 ;;
 esac

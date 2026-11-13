@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: scripts/e2e.sh <ephemeral-auth-key> [lan|nat]     (normally via ./warptail e2e [nat])
+# Usage: TS_TEST_AUTHKEY=… scripts/e2e.sh [lan|nat]     (normally via ./warptail e2e [nat])
 #
 # End-to-end proof from a real tailnet client's point of view, standing in for your phone:
 # a throwaway Tailscale node (ephemeral, so it disappears from your tailnet afterwards) joins
@@ -11,10 +11,11 @@
 # nat: the client sits on Docker's default bridge, behind the same hard NAT as warptail, like
 #   a remote device that can't hole-punch. The tailnet leg then needs DERP or a peer relay.
 set -euo pipefail
-key="$1" where="${2:-lan}"
+where="${1:-lan}"
+export TS_AUTHKEY="${TS_TEST_AUTHKEY:?set TS_TEST_AUTHKEY}"   # passed by name below, not by value
 C=warptail E=warptail-e2e
 SOCK=/var/run/tailscale/tailscaled.sock
-TS_IMAGE=tailscale/tailscale:v1.104.7
+TS_IMAGE=tailscale/tailscale:v1.104.7@sha256:72c1e19e0aedca96b8533bbb0b4368564410ff20b17e53b804eb6c1f04a31be4
 pass() { echo "  ✓ $*"; }
 fail() { echo "  ✗ $*"; exit 1; }
 trace() { docker exec "$E" wget -qO- -T "${1:-10}" https://www.cloudflare.com/cdn-cgi/trace; }
@@ -43,7 +44,7 @@ net=bridge
 echo "→ starting a throwaway tailnet client on $net that uses warptail as its exit node"
 docker rm -f "$E" >/dev/null 2>&1 || true
 docker run -d --name "$E" --network "$net" --cap-add NET_ADMIN --device /dev/net/tun \
-  -e TS_AUTHKEY="$key" -e TS_USERSPACE=false -e TS_HOSTNAME=warptail-e2e \
+  -e TS_AUTHKEY -e TS_USERSPACE=false -e TS_HOSTNAME=warptail-e2e \
   -e TS_EXTRA_ARGS="--exit-node=$exit_ip --accept-dns=true" \
   "$TS_IMAGE" >/dev/null
 for i in $(seq 1 60); do
@@ -68,7 +69,9 @@ echo "    client sees: ip=$cip warp=$cwarp"
 [[ "$cwarp" == on || "$cwarp" == plus ]] || fail "client egress is not WARP"
 [[ "$cip" != "$real4" ]] || fail "client egress is this host's real IP"
 pass "client traffic exits via WARP, not this host's IP"
-docker exec "$E" nslookup -timeout=5 example.com >/dev/null 2>&1 && pass "client DNS works through the exit node" || fail "client DNS failed"
+# A name nobody has looked up before, so the answer can't come from a cache.
+fresh() { echo "e2e-$RANDOM$RANDOM-$(date +%s).1.2.3.4.sslip.io"; }
+docker exec "$E" nslookup -timeout=5 "$(fresh)" >/dev/null 2>&1 && pass "client DNS works through the exit node" || fail "client DNS failed"
 
 echo "2) WARP cut off inside warptail (drop everything to $endpoint)"
 docker exec "$C" nft insert rule inet warp output ip daddr "$endpoint" drop comment '"e2e"'
@@ -76,12 +79,18 @@ sleep 3
 faulted() { docker exec "$C" nft list chain inet warp output | grep e2e >/dev/null; }
 for probe in "HTTPS by hostname:trace 8" \
              "HTTPS to 1.1.1.1:docker exec $E wget -qO- -T 8 https://1.1.1.1/cdn-cgi/trace" \
-             "ICMP to 9.9.9.9:docker exec $E ping -c2 -W3 9.9.9.9"; do
+             "ICMP to 9.9.9.9:docker exec $E ping -c2 -W3 9.9.9.9" \
+             "DNS for a fresh name:docker exec $E nslookup -timeout=5 $(fresh)"; do
   name="${probe%%:*}" cmd="${probe#*:}"
   faulted || fail "fault healed before '$name', inconclusive"
   if eval "$cmd" >/dev/null 2>&1; then fail "$name got through with WARP down"; fi
   pass "$name blocked"
 done
-pkts=$(docker exec "$C" nft list counter inet warp fwd_blocked | awk '/packets/ {print $2}')
-echo "    warptail fwd_blocked counter: $pkts packets"
+counter() { docker exec "$C" nft list counter inet warp "$1" | awk '/packets/ {print $2}'; }
+echo "    warptail fwd_blocked counter: $(counter fwd_blocked) packets"
+for c in docker_dns_blocked underlay_dns_blocked; do
+  n=$(counter "$c")
+  [[ "${n:-0}" -eq 0 ]] || fail "$c = $n: DNS tried to leave outside WARP"
+  pass "$c = 0: no DNS tried to leave outside WARP"
+done
 echo "end-to-end checks passed"
