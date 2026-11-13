@@ -20,6 +20,9 @@ fail() { echo "  ✗ $*"; exit 1; }
 trace() { docker exec "$E" wget -qO- -T "${1:-10}" https://www.cloudflare.com/cdn-cgi/trace; }
 
 cleanup() {
+  # Logging out deletes an ephemeral node from the tailnet right away, instead of leaving it
+  # listed as offline until Tailscale garbage-collects it.
+  docker exec "$E" tailscale logout >/dev/null 2>&1 || true
   docker rm -f "$E" >/dev/null 2>&1 || true
   if docker exec "$C" nft list chain inet warp output 2>/dev/null | grep e2e >/dev/null; then
     echo "→ restoring: restarting warptail"; docker restart "$C" >/dev/null
